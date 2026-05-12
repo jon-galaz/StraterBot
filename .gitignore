@@ -1,0 +1,33 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Data / outputs
+*.db
+sizing.json
+charts/
+*.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# uv
+.python-version
+
+# Runtime artifacts
+Logs.txt
+*.log
+docs/
+
+.claude/*

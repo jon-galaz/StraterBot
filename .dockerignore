@@ -1,0 +1,14 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
+*.db
+charts/
+*.html
+.git/
+.claude/
+tests/
+docs/
+*.md
+uv.lock

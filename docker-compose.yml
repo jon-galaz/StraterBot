@@ -1,0 +1,18 @@
+services:
+  trading:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Override DB path to use the persistent named volume
+      DATABASE_URL: "sqlite:////app/data/trading.db"
+    volumes:
+      - trading-data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  trading-data:
