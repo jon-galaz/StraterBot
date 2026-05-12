@@ -22,6 +22,7 @@ class TelegramNotifier:
         session_factory,
         timeout_minutes: int = 15,
         kill_switch=None,
+        trader_user_ids: list[int] | None = None,
     ) -> None:
         self.bot = bot
         self.chat_id = int(chat_id)
@@ -29,6 +30,7 @@ class TelegramNotifier:
         self.session_factory = session_factory
         self.timeout_minutes = timeout_minutes
         self.kill_switch = kill_switch
+        self.trader_user_ids: set[int] = set(trader_user_ids or [])
 
     # ── Signal card ───────────────────────────────────────────────────────────
 
@@ -65,6 +67,11 @@ class TelegramNotifier:
 
     async def handle_callback(self, update, context: CallbackContext) -> None:
         query = update.callback_query
+
+        if self.trader_user_ids and query.from_user.id not in self.trader_user_ids:
+            await query.answer("⛔ Only authorised traders can approve trades.", show_alert=True)
+            return
+
         await query.answer()
 
         try:

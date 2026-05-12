@@ -57,7 +57,14 @@ def build_app(settings: Settings) -> Application:
         session_factory=session_factory,
         timeout_minutes=settings.approval_timeout_minutes,
         kill_switch=kill_switch,
+        trader_user_ids=settings.trader_user_ids,
     )
+
+    def _is_trader(update) -> bool:
+        return (
+            not settings.trader_user_ids
+            or update.effective_user.id in settings.trader_user_ids
+        )
 
     chat_id = int(settings.telegram_chat_id)
 
@@ -78,10 +85,16 @@ def build_app(settings: Settings) -> Application:
         )
 
     async def cmd_reset_killswitch(update, context):
+        if not _is_trader(update):
+            await update.message.reply_text("⛔ Only authorised traders can use this command.")
+            return
         kill_switch.reset()
         await update.message.reply_text("✅ Kill switch reset. New entries allowed.")
 
     async def cmd_scan(update, context):
+        if not _is_trader(update):
+            await update.message.reply_text("⛔ Only authorised traders can use this command.")
+            return
         await update.message.reply_text("🔍 Running manual scan…")
         await scan_universe(settings, notifier, session_factory)
 
@@ -106,6 +119,9 @@ def build_app(settings: Settings) -> Application:
         )
 
     async def cmd_recompute_sizing(update, context):
+        if not _is_trader(update):
+            await update.message.reply_text("⛔ Only authorised traders can use this command.")
+            return
         await update.message.reply_text("📐 Recomputing per-ticker sizing… (~30s)")
         await recompute_sizing(bot=context.bot, target_chat_id=chat_id)
 

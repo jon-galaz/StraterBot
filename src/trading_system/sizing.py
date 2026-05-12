@@ -164,7 +164,7 @@ def compute_universe_sizing(
         try:
             bars = fetch_bars(ticker, start_s, end_s)
             bt = Backtest(bars, StraterStrategy, cash=10_000.0,
-                          commission=0.0, exclusive_orders=True)
+                          commission=0.0, exclusive_orders=True, finalize_trades=True)
             bt._strategy.ticker = ticker
             bt._strategy.risk_pct = 0.01
             stats_obj = bt.run()
