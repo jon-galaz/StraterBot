@@ -73,15 +73,7 @@ def build_chart(
     # ── Backtest — get trade entries/exits ────────────────────────────────────
     print("Running backtest for signal markers ...")
     result = run_backtest(ticker, start, end)
-    trades = result.equity_curve  # we need the _trades from stats
-
-    # Re-run to grab the raw stats (runner doesn't expose _trades)
-    from backtesting import Backtest
-    from trading_system.backtest.strategy import StraterStrategy
-    bt = Backtest(bars, StraterStrategy, cash=10_000, commission=0.0, exclusive_orders=True)
-    bt._strategy.ticker = ticker
-    stats = bt.run()
-    trades_df = stats["_trades"]
+    trades_df = result.trades  # raw trades, same run the metrics came from
 
     # ── Layout: price (row 1) + volume (row 2) ────────────────────────────────
     fig = make_subplots(

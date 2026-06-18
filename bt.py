@@ -14,12 +14,10 @@ Examples:
 import argparse
 import sys
 
-from backtesting import Backtest
-
 from trading_system.backtest.metrics import (
     calmar_ratio, cagr, max_drawdown, sharpe_ratio, sortino_ratio, win_rate,
 )
-from trading_system.backtest.strategy import StraterStrategy
+from trading_system.backtest.runner import run_strategy
 from trading_system.data.yfinance_adapter import fetch_bars
 
 
@@ -42,10 +40,7 @@ def main():
         print(f"Error: {e}")
         sys.exit(1)
 
-    bt = Backtest(bars, StraterStrategy, cash=args.cash, commission=0.0, exclusive_orders=True)
-    bt._strategy.ticker = args.ticker
-    bt._strategy.risk_pct = risk_pct
-    stats = bt.run()
+    bt, stats = run_strategy(bars, args.ticker, risk_pct, cash=args.cash)
 
     equity = stats["_equity_curve"]["Equity"]
     trades_df = stats["_trades"]

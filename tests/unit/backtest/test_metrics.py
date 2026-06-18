@@ -68,3 +68,15 @@ def test_win_rate_basic():
 
 def test_win_rate_empty():
     assert win_rate(pd.Series([], dtype=float)) == 0.0
+
+
+def test_sortino_inf_when_no_downside(equity_rising):
+    import math
+    # Monotonic rising equity has no negative returns → Sortino is infinite,
+    # not a misleading finite magic number.
+    assert math.isinf(sortino_ratio(equity_rising, freq="daily"))
+
+
+def test_calmar_inf_when_no_drawdown(equity_rising):
+    import math
+    assert math.isinf(calmar_ratio(equity_rising))

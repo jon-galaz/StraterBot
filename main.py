@@ -7,9 +7,19 @@ Trading system entry point.
 The process runs until interrupted (Ctrl+C).
 On startup it sends a status message to the configured Telegram chat.
 """
+import asyncio
+import io
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from loguru import logger
+from sqlalchemy import select
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler
+
+# US market close is 16:00 ET year-round; scheduling market-relative jobs in ET
+# (not a fixed UTC hour) keeps them correct across DST changes.
+ET = ZoneInfo("America/New_York")
 
 from trading_system.config import Settings
 from trading_system.data.alpaca_adapter import make_data_client
@@ -19,9 +29,11 @@ from trading_system.notifier.bot import TelegramNotifier
 from trading_system.safety.heartbeat import Heartbeat
 from trading_system.safety.kill_switch import KillSwitch
 from trading_system.safety.reconciliation import Reconciliation
+from trading_system.logging_setup import configure_logging, log_file_path, read_tail
 from trading_system.scanner.job import scan_universe
 from trading_system.sizing import compute_universe_sizing, save_risk_map
 from trading_system.store.db import init_db, make_engine, make_session_factory
+from trading_system.store.models import TradeRecord
 
 
 def build_app(settings: Settings) -> Application:
@@ -42,10 +54,18 @@ def build_app(settings: Settings) -> Application:
 
     # ── Safety ────────────────────────────────────────────────────────────────
     kill_switch    = KillSwitch(executor.client, settings)
+    executor.kill_switch = kill_switch  # executor re-checks it before every entry
     heartbeat      = Heartbeat()
     reconciliation = Reconciliation(executor.client, session_factory)
     data_client    = make_data_client(settings.alpaca_api_key, settings.alpaca_secret_key)
-    monitor        = PositionMonitor(executor.client, session_factory, data_client=data_client)
+    monitor        = PositionMonitor(executor.client, session_factory,
+                                     data_client=data_client, feed=settings.alpaca_data_feed)
+
+    if not settings.trader_user_ids:
+        logger.warning(
+            "TRADER_USER_IDS is empty — NO ONE can approve trades or run admin "
+            "commands (fail-closed). Set TRADER_USER_IDS before going live."
+        )
 
     # ── Telegram application ──────────────────────────────────────────────────
     app = Application.builder().token(settings.telegram_bot_token).build()
@@ -61,10 +81,9 @@ def build_app(settings: Settings) -> Application:
     )
 
     def _is_trader(update) -> bool:
-        return (
-            not settings.trader_user_ids
-            or update.effective_user.id in settings.trader_user_ids
-        )
+        # Fail closed: empty whitelist authorises no one.
+        user = update.effective_user
+        return user is not None and user.id in settings.trader_user_ids
 
     chat_id = int(settings.telegram_chat_id)
 
@@ -72,14 +91,29 @@ def build_app(settings: Settings) -> Application:
     app.add_handler(CallbackQueryHandler(notifier.handle_callback))
 
     async def cmd_status(update, context):
-        account = executor.client.get_account()
-        positions = executor.client.get_all_positions()
+        account = await asyncio.to_thread(executor.client.get_account)
+        positions = await asyncio.to_thread(executor.client.get_all_positions)
+        # Local open trades that haven't filled yet — approved orders that are
+        # in flight but aren't Alpaca *positions* yet (e.g. submitted after close,
+        # awaiting next open). Without this, an approved trade looks invisible.
+        with session_factory() as session:
+            pending = session.execute(
+                select(TradeRecord.ticker).where(
+                    TradeRecord.status == "open",
+                    TradeRecord.fill_price.is_(None),
+                )
+            ).scalars().all()
         mode = "📄 PAPER" if settings.alpaca_paper else "💰 LIVE"
+        pending_line = (
+            f"Pending:    {len(pending)}  ({', '.join(pending)})\n"
+            if pending else "Pending:    0\n"
+        )
         await update.message.reply_text(
             f"<b>System status</b>  {mode}\n\n"
             f"Equity:     ${float(account.equity):,.2f}\n"
             f"Cash:       ${float(account.cash):,.2f}\n"
-            f"Positions:  {len(positions)} / {settings.max_concurrent_positions}\n"
+            f"Positions:  {len(positions)} / {settings.max_concurrent_positions}  (filled)\n"
+            f"{pending_line}"
             f"Kill switch: {'🔴 TRIGGERED' if kill_switch.triggered else '🟢 OK'}",
             parse_mode="HTML",
         )
@@ -96,12 +130,48 @@ def build_app(settings: Settings) -> Application:
             await update.message.reply_text("⛔ Only authorised traders can use this command.")
             return
         await update.message.reply_text("🔍 Running manual scan…")
-        await scan_universe(settings, notifier, session_factory)
+        n = await scan_universe(settings, notifier, session_factory)
+        await update.message.reply_text(f"✅ Scan complete — {n} signal(s) found.")
+
+    async def cmd_logs(update, context):
+        # Sends logs to the chat for local analysis. Trader-only: logs include
+        # equity, tickers and order IDs (no API keys). NOTE: in a group chat the
+        # file is visible to everyone in the group — DM the bot for privacy.
+        if not _is_trader(update):
+            await update.message.reply_text("⛔ Only authorised traders can use this command.")
+            return
+        path = log_file_path(settings.database_url)
+        if not path.exists():
+            await update.message.reply_text("No log file yet.")
+            return
+
+        arg = context.args[0].lower() if context.args else "500"
+        if arg == "full":
+            await update.message.reply_document(
+                document=path.open("rb"),
+                filename=path.name,
+                caption="📜 Full current log file",
+            )
+            return
+
+        try:
+            n = max(1, min(int(arg), 5000))
+        except ValueError:
+            n = 500
+        text = await asyncio.to_thread(read_tail, path, n)
+        if not text.strip():
+            await update.message.reply_text("Log file is empty.")
+            return
+        buf = io.BytesIO(text.encode("utf-8"))
+        buf.name = f"strater_tail_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}.log"
+        await update.message.reply_document(document=buf, caption=f"📜 Last {n} log lines")
 
     async def recompute_sizing(bot=None, target_chat_id=None):
         """Refresh per-ticker risk_pct from a 2-yr rolling backtest."""
         logger.info("Sizing: recomputing per-ticker Kelly")
-        risk_map, stats = compute_universe_sizing(list(settings.universe))
+        # ~30s, CPU/network heavy — keep it off the event loop so the bot,
+        # heartbeat and kill switch stay responsive while it runs.
+        risk_map, stats = await asyncio.to_thread(compute_universe_sizing, list(settings.universe))
         path = save_risk_map(risk_map, settings.database_url)
         logger.info(f"Sizing: wrote {len(risk_map)} entries to {path}")
         if bot is None:
@@ -129,15 +199,31 @@ def build_app(settings: Settings) -> Application:
     app.add_handler(CommandHandler("reset_killswitch", cmd_reset_killswitch))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("recompute_sizing", cmd_recompute_sizing))
+    app.add_handler(CommandHandler("logs", cmd_logs))
+
+    async def on_error(update, context):
+        # Without this, handler exceptions are logged by PTB but invisible to the
+        # trader — for a trading tool, surface failures loudly.
+        logger.exception(f"Unhandled handler error: {context.error}")
+        try:
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ <b>Internal error</b>: <code>{context.error}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    app.add_error_handler(on_error)
 
     # ── Scheduler (starts after Telegram bot is up) ───────────────────────────
     async def post_init(application: Application) -> None:
         scheduler = AsyncIOScheduler(timezone="UTC")
 
-        # Scanner: weekdays at 21:05 UTC (17:05 ET — 5 min after close)
+        # Scanner: weekdays at 16:05 ET (5 min after the 16:00 close, DST-safe)
         scheduler.add_job(
             scan_universe, "cron",
-            day_of_week="mon-fri", hour=21, minute=5,
+            day_of_week="mon-fri", hour=16, minute=5, timezone=ET,
             args=[settings, notifier, session_factory],
             id="scanner",
         )
@@ -166,10 +252,10 @@ def build_app(settings: Settings) -> Application:
             notifier.expire_pending_signals, "interval", minutes=5,
             id="signal_timeout",
         )
-        # Daily reconciliation: weekdays at 22:00 UTC
+        # Daily reconciliation: weekdays at 16:30 ET (after close, DST-safe)
         scheduler.add_job(
             reconciliation.run, "cron",
-            day_of_week="mon-fri", hour=22, minute=0,
+            day_of_week="mon-fri", hour=16, minute=30, timezone=ET,
             args=[application.bot, chat_id],
             id="reconciliation",
         )
@@ -191,11 +277,11 @@ def build_app(settings: Settings) -> Application:
             text=(
                 f"🟢 <b>Trading system started</b>  {mode}\n\n"
                 f"Universe: {', '.join(settings.universe)}\n"
-                f"Scanner:  weekdays 21:05 UTC\n"
+                f"Scanner:  weekdays 16:05 ET\n"
                 f"Max positions: {settings.max_concurrent_positions}\n"
                 f"Daily max loss: {settings.daily_max_loss_pct}%\n"
                 f"Approval timeout: {settings.approval_timeout_minutes} min\n\n"
-                f"Commands: /status  /scan  /recompute_sizing  /reset_killswitch"
+                f"Commands: /status  /scan  /recompute_sizing  /reset_killswitch  /logs"
             ),
             parse_mode="HTML",
         )
@@ -214,6 +300,7 @@ def build_app(settings: Settings) -> Application:
 
 if __name__ == "__main__":
     settings = Settings()
+    configure_logging(settings.database_url)
     app = build_app(settings)
     logger.info(f"Starting — paper={settings.alpaca_paper}")
     app.run_polling(drop_pending_updates=True)

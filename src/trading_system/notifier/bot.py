@@ -2,10 +2,11 @@
 TelegramNotifier — sends signal cards with Approve/Reject buttons and
 handles trader callbacks. All approval routing goes through here.
 """
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, update
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackContext
 
@@ -68,7 +69,10 @@ class TelegramNotifier:
     async def handle_callback(self, update, context: CallbackContext) -> None:
         query = update.callback_query
 
-        if self.trader_user_ids and query.from_user.id not in self.trader_user_ids:
+        # Fail closed: only whitelisted traders may act. An empty whitelist
+        # authorises NO ONE (a misconfigured allowlist must never open trading).
+        user = query.from_user
+        if user is None or user.id not in self.trader_user_ids:
             await query.answer("⛔ Only authorised traders can approve trades.", show_alert=True)
             return
 
@@ -103,7 +107,9 @@ class TelegramNotifier:
                 )
                 return
             try:
-                order_id = self.executor.execute(signal_id)
+                # Executor does blocking broker + DB I/O — run off the event
+                # loop so approvals/heartbeat/kill-switch jobs keep running.
+                order_id = await asyncio.to_thread(self.executor.execute, signal_id)
                 await query.edit_message_text(
                     f"✅ <b>#{signal_id} {record.ticker} — APPROVED</b>\n"
                     f"Order submitted to Alpaca.\n"
@@ -132,25 +138,37 @@ class TelegramNotifier:
     async def expire_pending_signals(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.timeout_minutes)
 
+        # Transition status FIRST, guarded so a signal a trader just approved
+        # (now 'executing'/'executed') is never clobbered back to 'expired'.
+        # Telegram edits happen afterwards, outside the DB session, so we never
+        # hold a SQLite transaction open across slow network calls.
+        expired: list[tuple[int, str, int | None]] = []
         with self.session_factory() as session:
-            records = session.execute(
+            candidates = session.execute(
                 select(SignalRecord).where(
                     SignalRecord.status == "pending",
                     SignalRecord.timestamp < cutoff,
                 )
             ).scalars().all()
 
-            for record in records:
-                record.status = "expired"
-                if record.telegram_message_id:
-                    try:
-                        await self.bot.edit_message_text(
-                            chat_id=self.chat_id,
-                            message_id=record.telegram_message_id,
-                            text=f"⏰ Signal #{record.id} ({record.ticker}) expired — no action taken.",
-                        )
-                    except Exception:
-                        pass
-                logger.info(f"Signal {record.id} ({record.ticker}) expired")
-
+            for record in candidates:
+                changed = session.execute(
+                    update(SignalRecord)
+                    .where(SignalRecord.id == record.id, SignalRecord.status == "pending")
+                    .values(status="expired")
+                ).rowcount
+                if changed == 1:
+                    expired.append((record.id, record.ticker, record.telegram_message_id))
             session.commit()
+
+        for sig_id, ticker, message_id in expired:
+            logger.info(f"Signal {sig_id} ({ticker}) expired")
+            if message_id:
+                try:
+                    await self.bot.edit_message_text(
+                        chat_id=self.chat_id,
+                        message_id=message_id,
+                        text=f"⏰ Signal #{sig_id} ({ticker}) expired — no action taken.",
+                    )
+                except Exception:
+                    pass

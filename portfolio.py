@@ -24,20 +24,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from trading_system.backtest.runner import BacktestResult, run_backtest
+from trading_system.config import DEFAULT_UNIVERSE
 from trading_system.sizing import KellyStats, kelly_table
-
-DEFAULT_UNIVERSE = [
-    "AAPL", "MSFT", "NVDA", "AVGO", "AMD",
-    "GOOGL", "META", "NFLX",
-    "AMZN", "TSLA", "HD", "LULU",
-    "COST", "KO", "WMT",
-    "JPM", "V", "MA",
-    "JNJ", "UNH", "LLY",
-    "CAT", "URI", "AXON",
-    "XOM", "CVX",
-    "FCX", "NEE", "AMT",
-    "ELF",
-]
 
 CHARTS_DIR = Path("charts")
 
@@ -99,17 +87,19 @@ def print_summary(results):
             "Sharpe":   f"{r.sharpe_ratio:.2f}",
             "Max DD":   f"{r.max_drawdown_pct:.1f}%",
             "Win Rate": f"{r.win_rate:.0f}%",
+            "Exposure": f"{r.exposure_pct:.0f}%",
             "Trades":   r.n_trades,
         })
     df = pd.DataFrame(rows).set_index("Ticker")
     avg_ret = sum(r.total_return_pct for r in results.values()) / len(results)
     avg_sr  = sum(r.sharpe_ratio     for r in results.values()) / len(results)
+    avg_exp = sum(r.exposure_pct     for r in results.values()) / len(results)
     df.loc["AVG"] = {"Return": f"{avg_ret:+.1f}%", "CAGR": "-",
                      "Sharpe": f"{avg_sr:.2f}", "Max DD": "-",
-                     "Win Rate": "-", "Trades": "-"}
-    print("\n" + "-" * 56)
+                     "Win Rate": "-", "Exposure": f"{avg_exp:.0f}%", "Trades": "-"}
+    print("\n" + "-" * 64)
     print(df.to_string())
-    print("-" * 56 + "\n")
+    print("-" * 64 + "\n")
 
 
 # ── Kelly summary ─────────────────────────────────────────────────────────────
@@ -136,34 +126,21 @@ def print_kelly_table(stats: list) -> None:
 
 # ── Collect all trades ────────────────────────────────────────────────────────
 
-def collect_all_trades(tickers, start, end, cash=10_000.0, risk_pct=0.01):
-    """Re-run backtests to extract raw trade DataFrames."""
-    from backtesting import Backtest
-    from trading_system.backtest.strategy import StraterStrategy
-    from trading_system.data.yfinance_adapter import fetch_bars
+def combine_trades(results: dict) -> pd.DataFrame:
+    """Build one trade table from the trades already computed by each backtest.
 
-    all_trades = []
-    for ticker in tickers:
-        try:
-            bars  = fetch_bars(ticker, start, end)
-            bt    = Backtest(bars, StraterStrategy, cash=cash,
-                             commission=0.0, exclusive_orders=True)
-            bt._strategy.ticker = ticker
-            bt._strategy.risk_pct = _resolve_risk(risk_pct, ticker)
-            stats = bt.run()
-            df = stats["_trades"].copy()
-            if not df.empty:
-                df["Ticker"] = ticker
-                all_trades.append(df)
-        except Exception:
-            pass
-
-    if not all_trades:
+    No re-running: run_backtest now returns the raw trades (tagged with Ticker),
+    so this is the same data the metrics came from — same commission, same
+    finalize policy — never a divergent second run.
+    """
+    frames = [r.trades for r in results.values() if not r.trades.empty]
+    if not frames:
         return pd.DataFrame()
-
-    combined = pd.concat(all_trades, ignore_index=True)
-    combined = combined.sort_values("EntryTime").reset_index(drop=True)
-    return combined
+    return (
+        pd.concat(frames, ignore_index=True)
+        .sort_values("EntryTime")
+        .reset_index(drop=True)
+    )
 
 
 # ── Chart ─────────────────────────────────────────────────────────────────────
@@ -364,9 +341,8 @@ def main():
         print("=" * 64)
         print("PASS 1 — uniform 1% risk to gather per-ticker edge stats")
         print("=" * 64)
-        run_portfolio(tickers, args.start, args.end, cash=args.cash, risk_pct=0.01)
-        pass1_trades = collect_all_trades(tickers, args.start, args.end,
-                                          cash=args.cash, risk_pct=0.01)
+        pass1_results = run_portfolio(tickers, args.start, args.end, cash=args.cash, risk_pct=0.01)
+        pass1_trades = combine_trades(pass1_results)
 
         # Compute Kelly per ticker
         stats = kelly_table(pass1_trades, tickers)
@@ -401,8 +377,7 @@ def main():
         return
 
     print("Collecting trade details ...")
-    all_trades = collect_all_trades(list(results.keys()), args.start, args.end,
-                                    cash=args.cash, risk_pct=risk_pct)
+    all_trades = combine_trades(results)
 
     print("Building portfolio chart ...")
     fig = build_portfolio_chart(results, all_trades, args.start, args.end, risk_pct=risk_pct)

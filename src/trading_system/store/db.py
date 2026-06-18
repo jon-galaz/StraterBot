@@ -8,7 +8,11 @@ def init_db(engine: Engine) -> None:
 
 
 def make_engine(database_url: str) -> Engine:
-    return create_engine(database_url, echo=False)
+    # Execution and sizing now run via asyncio.to_thread, so DB sessions may be
+    # created on worker threads. SQLite's default thread-affinity check rejects
+    # that; disable it (each session still uses its own connection per call).
+    connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
+    return create_engine(database_url, echo=False, connect_args=connect_args)
 
 
 def make_session_factory(engine: Engine):

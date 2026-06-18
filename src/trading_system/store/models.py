@@ -42,6 +42,8 @@ class TradeRecord(Base):
     exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
     alpaca_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    client_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Deterministic per-signal key (sig-<signal_id>). Unique so a duplicate
+    # submission can never create a second trade row for the same signal.
+    client_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
 
     signal: Mapped["SignalRecord"] = relationship("SignalRecord", back_populates="trades")

@@ -44,10 +44,13 @@ def kelly_fraction(trades: pd.DataFrame) -> tuple[float, float, float, float]:
     if trades.empty:
         return 0.0, 0.0, 0.0, 0.0
     wins = trades[trades["PnL"] > 0]
-    losses = trades[trades["PnL"] <= 0]
-    if len(wins) == 0 or len(losses) == 0:
+    losses = trades[trades["PnL"] < 0]
+    # Scratch trades (PnL == 0) are neither wins nor losses — excluding them from
+    # both keeps p and avg_loss internally consistent (p over decisive trades).
+    n_decisive = len(wins) + len(losses)
+    if len(wins) == 0 or len(losses) == 0 or n_decisive == 0:
         return 0.0, 0.0, 0.0, 0.0
-    p = len(wins) / len(trades)
+    p = len(wins) / n_decisive
     avg_win = float(wins["PnL"].mean())
     avg_loss = abs(float(losses["PnL"].mean()))
     if avg_loss <= 0:
@@ -150,9 +153,7 @@ def compute_universe_sizing(
 
     Tickers with insufficient trades or non-positive Kelly get risk_pct = 0.
     """
-    from backtesting import Backtest
-
-    from trading_system.backtest.strategy import StraterStrategy
+    from trading_system.backtest.runner import run_strategy
     from trading_system.data.yfinance_adapter import fetch_bars
 
     end = datetime.now(timezone.utc).date()
@@ -163,11 +164,7 @@ def compute_universe_sizing(
     for ticker in tickers:
         try:
             bars = fetch_bars(ticker, start_s, end_s)
-            bt = Backtest(bars, StraterStrategy, cash=10_000.0,
-                          commission=0.0, exclusive_orders=True, finalize_trades=True)
-            bt._strategy.ticker = ticker
-            bt._strategy.risk_pct = 0.01
-            stats_obj = bt.run()
+            _, stats_obj = run_strategy(bars, ticker, risk_pct=0.01, cash=10_000.0)
             df = stats_obj["_trades"].copy()
             if not df.empty:
                 df["Ticker"] = ticker

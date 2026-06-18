@@ -11,24 +11,13 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
+from loguru import logger
 
 from trading_system.backtest import strategy as strat_mod
 from trading_system.backtest.runner import run_backtest
+from trading_system.config import DEFAULT_UNIVERSE
 from trading_system.data.yfinance_adapter import fetch_bars
 from trading_system.rules.indicators import compute_market_regime
-
-DEFAULT_UNIVERSE = [
-    "AAPL", "MSFT", "NVDA", "AVGO", "AMD",
-    "GOOGL", "META", "NFLX",
-    "AMZN", "TSLA", "HD", "LULU",
-    "COST", "KO", "WMT",
-    "JPM", "V", "MA",
-    "JNJ", "UNH", "LLY",
-    "CAT", "URI", "AXON",
-    "XOM", "CVX",
-    "FCX", "NEE", "AMT",
-    "ELF",
-]
 
 # Keep trail + entry-dist ON for the sweep (both confirmed net-positive).
 strat_mod._LOCK_R_THRESHOLD  = 1.0
@@ -57,6 +46,7 @@ def run_with_regime(tickers, start, end, regime_series):
             return t, run_backtest(t, start, end, risk_pct=0.01,
                                    regime_series=regime_series)
         except Exception as exc:
+            logger.warning(f"regime_sweep {t}: {exc}")
             return t, exc
 
     sharpes, returns, trades = [], [], []
@@ -117,6 +107,8 @@ def main():
         rows.append({"MA period": label, "Regime on %": f"{pct_on:.0f}%", **result})
 
     df = pd.DataFrame(rows).set_index("MA period")
+    # Keep the raw numeric Sharpes for the decision before formatting for display.
+    raw_sharpes = df["avg_sharpe"].tolist()
     df["avg_sharpe"] = df["avg_sharpe"].map("{:+.3f}".format)
     df["avg_return"] = df["avg_return"].map("{:+.1f}%".format)
     print("\n" + "─" * 70)
@@ -124,7 +116,6 @@ def main():
     print("─" * 70)
 
     # Decision: is any filtered version better than no-filter?
-    raw_sharpes = [float(df.loc[r, "avg_sharpe"]) for r in df.index]
     no_gate_sharpe = raw_sharpes[0]
     best_filtered = max(raw_sharpes[1:])
     best_label = df.index[raw_sharpes.index(best_filtered)]

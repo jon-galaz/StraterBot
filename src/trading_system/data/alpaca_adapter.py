@@ -21,23 +21,28 @@ def fetch_bars(
     client: StockHistoricalDataClient,
     ticker: str,
     days_back: int = 120,
+    feed: str = "iex",
 ) -> pd.DataFrame:
     """
     Fetch the last `days_back` calendar days of daily bars for `ticker`.
     Returns a DataFrame with columns Open/High/Low/Close/Volume and a
     timezone-naive DatetimeIndex — identical shape to yfinance_adapter output.
+
+    `feed` is "iex" (free, partial volume) or "sip" (paid, consolidated tape).
+    Use "sip" in production so the volume-confirmation filter matches backtest.
     """
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days_back)
 
-    logger.debug(f"Fetching {ticker} from Alpaca IEX ({days_back}d back)")
+    data_feed = DataFeed.SIP if feed.lower() == "sip" else DataFeed.IEX
+    logger.debug(f"Fetching {ticker} from Alpaca {data_feed.value.upper()} ({days_back}d back)")
 
     request = StockBarsRequest(
         symbol_or_symbols=ticker,
         timeframe=TimeFrame.Day,
         start=start,
         end=end,
-        feed=DataFeed.IEX,
+        feed=data_feed,
     )
     df = client.get_stock_bars(request).df
 

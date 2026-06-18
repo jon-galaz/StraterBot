@@ -2,6 +2,8 @@
 Reconciliation — daily job that compares local open trades vs Alpaca
 positions and alerts the trader on any mismatch.
 """
+import asyncio
+
 from alpaca.trading.client import TradingClient
 from loguru import logger
 from sqlalchemy import select
@@ -18,20 +20,32 @@ class Reconciliation:
     async def run(self, bot: Bot, chat_id: int) -> None:
         logger.info("Running daily reconciliation")
         try:
-            alpaca_positions = {p.symbol: p for p in self.client.get_all_positions()}
+            positions = await asyncio.to_thread(self.client.get_all_positions)
+            alpaca_positions = {p.symbol: p for p in positions}
 
             with self.session_factory() as session:
                 open_trades = session.execute(
                     select(TradeRecord).where(TradeRecord.status == "open")
                 ).scalars().all()
-            local_tickers = {t.ticker for t in open_trades}
+                # Sum qty per ticker inside the session (avoids detached access).
+                local_qty: dict[str, float] = {}
+                for t in open_trades:
+                    local_qty[t.ticker] = local_qty.get(t.ticker, 0.0) + float(t.qty or 0.0)
 
             mismatches: list[str] = []
-            for ticker in local_tickers:
-                if ticker not in alpaca_positions:
+            for ticker, qty in local_qty.items():
+                pos = alpaca_positions.get(ticker)
+                if pos is None:
                     mismatches.append(f"• LOCAL open: <b>{ticker}</b> — not found in Alpaca")
+                else:
+                    broker_qty = abs(float(pos.qty))
+                    # Tolerate sub-share float noise only.
+                    if abs(broker_qty - qty) > 1e-6:
+                        mismatches.append(
+                            f"• QTY mismatch <b>{ticker}</b>: local {qty:g} vs Alpaca {broker_qty:g}"
+                        )
             for symbol in alpaca_positions:
-                if symbol not in local_tickers:
+                if symbol not in local_qty:
                     mismatches.append(f"• ALPACA open: <b>{symbol}</b> — not in local DB")
 
             if mismatches:

@@ -3,6 +3,8 @@ Scanner job — runs after US market close (scheduled via APScheduler).
 Fetches latest bars from Alpaca, evaluates the rule engine for every
 ticker in the universe, and sends any signals to Telegram for approval.
 """
+import asyncio
+
 from loguru import logger
 from sqlalchemy import select
 
@@ -34,7 +36,14 @@ def _ticker_is_active(ticker: str, session_factory) -> bool:
         return open_trade is not None
 
 
-async def scan_universe(settings: Settings, notifier, session_factory) -> None:
+def _fetch_and_evaluate(settings: Settings, ticker: str, data_client):
+    """Blocking network fetch + indicator eval — run off the event loop."""
+    bars = fetch_bars(data_client, ticker, feed=settings.alpaca_data_feed)
+    return RuleEngine(ticker).evaluate(bars)
+
+
+async def scan_universe(settings: Settings, notifier, session_factory) -> int:
+    """Scan the universe and dispatch signals. Returns the number found."""
     logger.info("Scanner: starting universe scan")
 
     data_client = make_data_client(settings.alpaca_api_key, settings.alpaca_secret_key)
@@ -54,8 +63,9 @@ async def scan_universe(settings: Settings, notifier, session_factory) -> None:
                 logger.debug(f"{ticker}: skipped — dropped by sizing model")
                 continue
 
-            bars = fetch_bars(data_client, ticker)
-            signal = RuleEngine(ticker).evaluate(bars)
+            # Offload the blocking per-ticker work so the bot, heartbeat and
+            # kill switch stay responsive during the (~30-ticker) scan.
+            signal = await asyncio.to_thread(_fetch_and_evaluate, settings, ticker, data_client)
 
             if signal is None:
                 logger.debug(f"{ticker}: no signal")
@@ -87,3 +97,4 @@ async def scan_universe(settings: Settings, notifier, session_factory) -> None:
             logger.error(f"Scanner error [{ticker}]: {exc}")
 
     logger.info(f"Scanner: done — {signals_found} signal(s) found")
+    return signals_found

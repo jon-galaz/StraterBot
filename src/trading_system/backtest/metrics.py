@@ -54,7 +54,9 @@ def sharpe_ratio(equity: pd.Series, freq: str = "daily", risk_free: float = 0.0)
         return 0.0
 
     ann_factor = _annualization_factor(freq)
-    excess_return = returns.mean() - risk_free / 252  # Assuming daily data
+    # Per-period risk-free = annual / periods-per-year (= ann_factor**2), so this
+    # stays correct for non-daily frequencies, not just daily.
+    excess_return = returns.mean() - risk_free / (ann_factor ** 2)
     return float((excess_return / returns.std()) * ann_factor)
 
 
@@ -84,16 +86,18 @@ def sortino_ratio(equity: pd.Series, freq: str = "daily", risk_free: float = 0.0
     # Downside deviation: std of negative returns only
     negative_returns = returns[returns < 0]
 
-    # If no negative returns, downside volatility is 0 — treat as very high Sortino
+    # No downside at all → Sortino is mathematically infinite (undefined). Return
+    # inf rather than a magic-number scaled by an arbitrary 1e-6, which produced
+    # misleading finite values that corrupted any averaging/sorting.
     if len(negative_returns) == 0:
-        return float(mean_return) * _annualization_factor(freq) / 1e-6  # Very high ratio
+        return float("inf")
 
     downside_vol = negative_returns.std()
     if downside_vol == 0:
-        return float(mean_return) * _annualization_factor(freq) / 1e-6  # Very high ratio
+        return float("inf")
 
     ann_factor = _annualization_factor(freq)
-    excess_return = mean_return - risk_free / 252
+    excess_return = mean_return - risk_free / (ann_factor ** 2)
     return float((excess_return / downside_vol) * ann_factor)
 
 
@@ -159,9 +163,9 @@ def calmar_ratio(equity: pd.Series) -> float:
     if annual_return <= 0:
         return 0.0
 
-    # If no drawdown (perfectly ascending), return a very high ratio
+    # No drawdown (perfectly ascending) → Calmar is infinite by definition.
     if mdd == 0:
-        return float(annual_return) / 1e-6  # Very high ratio
+        return float("inf")
 
     return float(annual_return / abs(mdd))
 

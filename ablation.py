@@ -14,23 +14,12 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
+from loguru import logger
 
 from trading_system.backtest import strategy as strat_mod
 from trading_system.backtest.runner import fetch_regime_series, run_backtest
+from trading_system.config import DEFAULT_UNIVERSE
 from trading_system.rules import engine as engine_mod
-
-DEFAULT_UNIVERSE = [
-    "AAPL", "MSFT", "NVDA", "AVGO", "AMD",
-    "GOOGL", "META", "NFLX",
-    "AMZN", "TSLA", "HD", "LULU",
-    "COST", "KO", "WMT",
-    "JPM", "V", "MA",
-    "JNJ", "UNH", "LLY",
-    "CAT", "URI", "AXON",
-    "XOM", "CVX",
-    "FCX", "NEE", "AMT",
-    "ELF",
-]
 
 # Snapshot of production constants we will toggle.
 _ORIG = {
@@ -70,6 +59,7 @@ def run_scenario(name, tickers, start, end, *, regime, trail, entry_dist, real_r
         try:
             return t, run_backtest(t, start, end, risk_pct=0.01, regime_series=series)
         except Exception as exc:
+            logger.warning(f"ablation {t}: {exc}")
             return t, exc
 
     sharpes, returns, trade_counts = [], [], []

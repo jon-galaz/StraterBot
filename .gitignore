@@ -28,6 +28,8 @@ charts/
 # Runtime artifacts
 Logs.txt
 *.log
+*Log.txt
+Strater Log.txt
 docs/
 
 .claude/*

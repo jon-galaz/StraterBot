@@ -1,0 +1,200 @@
+================================================================================
+CHANGELOG — 2026-06-18  Phase 2 code-review hardening
+================================================================================
+Multi-agent code review + fixes across the whole app before paper deployment.
+Tests: 37 -> 55 passing. See decisions/2026-06-18-phase2-code-review-hardening.md
+for rationale.
+
+--------------------------------------------------------------------------------
+SAFETY / LIVE EXECUTION
+--------------------------------------------------------------------------------
+src/trading_system/executor/alpaca_executor.py
+  - Deterministic client_order_id = "sig-<signal_id>" (was random uuid4 every
+    call) so duplicate/retry submissions are rejected by Alpaca. REAL idempotency.
+  - Atomic claim: guarded UPDATE pending->executing + rowcount check before any
+    broker call; process-wide threading.Lock serialises executions.
+  - Kill switch is re-checked inside execute() (not just in the notifier).
+  - Position-cap and duplicate-ticker checks now count local open TradeRecords
+    (includes submitted-but-unfilled orders) instead of only filled positions.
+  - Pre-submit failures release the claim back to pending; broker failures fail
+    closed (left 'executing', never auto-retried).
+
+src/trading_system/store/models.py
+  - TradeRecord.client_order_id is now unique=True (DB-level dup backstop).
+
+src/trading_system/safety/kill_switch.py
+  - Triggered state persisted to date-keyed kill_switch.json -> survives restart.
+  - 'triggered' is now a property (true only if it fired today).
+  - On breach: latch halt + alert FIRST, then liquidate; verify
+    close_all_positions results and escalate loudly on partial/total failure.
+
+src/trading_system/safety/heartbeat.py
+  - Startup-grace handling so a scheduler that never pings still alarms (was a
+    permanent no-op when last_ping stayed None). Documented in-process limitation.
+
+src/trading_system/safety/reconciliation.py
+  - Detects per-ticker QUANTITY drift (local vs broker), not just presence.
+  - Local quantities summed inside the session (no detached-instance access).
+
+src/trading_system/monitor/position_monitor.py
+  - Records ACTUAL filled qty from the position (handles partial fills) for
+    correct P&L and reconciliation.
+  - Adds shared-engine Donchian-breakdown exit so live exits match the backtest
+    (closes the position via close_position on breakdown).
+  - _get_exit_price falls back to the most recent filled SELL order when there's
+    no bracket leg fill (breakdown / manual close) -> taxable price still logged.
+  - Won't mark an order 'cancelled' when the open-orders fetch failed (was
+    assuming "no pending orders").
+  - Refactored: _maybe_trail_sl -> _manage_filled_position (+ _trail_sl), fetches
+    bars once; honours the configured data feed.
+
+--------------------------------------------------------------------------------
+APP WIRING (main.py, notifier)
+--------------------------------------------------------------------------------
+src/trading_system/notifier/bot.py
+  - Trader auth fails CLOSED: empty whitelist authorises no one.
+  - Approval execution runs via asyncio.to_thread (no event-loop blocking).
+  - expire_pending_signals: status changes committed first (guarded per-record),
+    Telegram edits done outside the DB session; can't clobber a just-approved card.
+
+main.py
+  - Wires kill_switch into the executor; passes data feed to the monitor.
+  - _is_trader fails closed; warns loudly at startup if TRADER_USER_IDS is empty.
+  - /status and the sizing recompute run via asyncio.to_thread.
+  - Global error handler (app.add_error_handler) surfaces failures to the chat.
+  - Scanner (16:05) and reconciliation (16:30) scheduled in America/New_York
+    (DST-safe) instead of fixed UTC.
+
+src/trading_system/store/db.py
+  - SQLite engines opened with check_same_thread=False (sessions may now be
+    created on worker threads via to_thread).
+
+--------------------------------------------------------------------------------
+BACKTEST MATH & RESEARCH TOOLING
+--------------------------------------------------------------------------------
+src/trading_system/backtest/metrics.py
+  - Sortino/Calmar return inf for undefined cases (was misleading /1e-6 numbers).
+  - Risk-free de-annualised by periods-per-year, not hardcoded /252.
+
+src/trading_system/sizing.py
+  - kelly_fraction excludes scratch trades (PnL==0) from wins AND losses;
+    p is computed over decisive trades only.
+  - compute_universe_sizing uses the shared run_strategy helper.
+
+src/trading_system/backtest/runner.py
+  - New build_backtest() / run_strategy() helpers (single source of truth;
+    thread-safe params via Backtest.run(**kwargs)).
+  - fetch_regime_series() added (SPY close > SMA).
+  - run_backtest supports regime_series and now returns the raw trades in
+    BacktestResult.trades (tagged with Ticker). finalize_trades=True everywhere.
+
+src/trading_system/backtest/strategy.py
+  - Optional regime_series gate (per-instance; thread-safe). Removed redundant
+    self.data.df slice in next().
+
+portfolio.py
+  - Imports DEFAULT_UNIVERSE from config (was a 4th copy).
+  - collect_all_trades() (a divergent second backtest run) replaced by
+    combine_trades() built from results' trades.
+
+bt.py / chart.py
+  - Use the shared helper / runner; consistent COMMISSION (were commission=0.0);
+    chart.py no longer runs the backtest twice.
+
+ablation.py / regime_sweep.py
+  - FIXED: were calling a non-existent fetch_regime_series / regime_series param
+    and silently producing all-zero garbage. Now use the real regime API, import
+    DEFAULT_UNIVERSE from config, and log (not swallow) per-ticker errors.
+  - regime_sweep: decision uses raw numeric Sharpes (no string round-trip).
+
+--------------------------------------------------------------------------------
+CONFIG & DATA
+--------------------------------------------------------------------------------
+src/trading_system/config.py
+  - Removed the custom env-source machinery; use Annotated[list, NoDecode] +
+    validators. DEFAULT_UNIVERSE now defined here (single source of truth).
+  - New alpaca_data_feed setting (iex|sip) for live volume reproducibility.
+
+src/trading_system/data/alpaca_adapter.py
+  - fetch_bars accepts feed= ("iex"/"sip").
+
+src/trading_system/scanner/job.py
+  - Passes the configured feed to fetch_bars.
+
+--------------------------------------------------------------------------------
+TESTS (new)
+--------------------------------------------------------------------------------
+tests/unit/test_executor.py        - idempotency, atomic claim, kill-switch
+                                       guard, cap & duplicate protection
+tests/unit/test_kill_switch.py     - durable state across restart, reset,
+                                       alert-despite-liquidation-failure
+tests/unit/test_reconciliation.py  - quantity-mismatch detection
+tests/unit/test_sizing.py          - Kelly scratch-trade handling
+tests/unit/test_config.py          - trader_user_ids parsing + fail-closed default
+tests/unit/backtest/test_metrics.py- Sortino/Calmar inf cases
+
+--------------------------------------------------------------------------------
+2026-06-18 (addendum) — Telegram command gaps
+--------------------------------------------------------------------------------
+main.py
+  - /status now also shows PENDING trades (local open TradeRecords with no fill
+    yet) — an approved order that hasn't filled (e.g. submitted after close,
+    awaiting next open) is no longer invisible. Was: filled Alpaca positions only.
+  - /scan now reports the number of signals found.
+
+src/trading_system/scanner/job.py
+  - scan_universe offloads the blocking per-ticker fetch+evaluate via
+    asyncio.to_thread (was blocking the event loop for the whole ~30-ticker scan,
+    same class of bug as execute/status/sizing) and now returns the signal count.
+
+UPDATE (resolved below): the scheduled jobs now offload their blocking broker
+calls too — see "scheduled jobs no longer block the loop".
+
+--------------------------------------------------------------------------------
+2026-06-18 (addendum) — Scheduled jobs no longer block the event loop
+--------------------------------------------------------------------------------
+All remaining blocking Alpaca/data calls in the async scheduled jobs are now run
+via asyncio.to_thread (async Telegram sends + DB sessions stay on the loop). The
+bot, heartbeat and kill switch stay responsive even when a broker call is slow.
+
+src/trading_system/monitor/position_monitor.py
+  - get_all_positions, get_orders, get_order_by_id, replace_order_by_id,
+    close_position, and the Alpaca bar fetch are all offloaded.
+  - _trail_sl and _get_exit_price became async (await their offloaded calls).
+
+src/trading_system/safety/kill_switch.py
+  - get_account and close_all_positions offloaded.
+
+src/trading_system/safety/reconciliation.py
+  - get_all_positions offloaded.
+
+--------------------------------------------------------------------------------
+2026-06-18 (addendum) — Persistent logs + /logs command
+--------------------------------------------------------------------------------
+src/trading_system/logging_setup.py  (NEW)
+  - configure_logging(): loguru -> stderr (INFO) + rotating file (DEBUG) at
+    <db_dir>/strater.log. rotation=10MB, retention=14d, compression=zip,
+    enqueue=True (thread/async-safe), diagnose=False (no variable dumps -> no
+    secret leakage). In Docker the file lands in /app/data (the persistent
+    trading-data volume), so logs survive restarts/redeploys.
+  - log_file_path(), read_tail() helpers.
+
+main.py
+  - configure_logging() called at startup; was loguru-default (stderr only,
+    lost when the container is recreated).
+  - NEW /logs command (trader-only): "/logs" sends the last 500 log lines as a
+    .log document, "/logs N" sends the last N (max 5000), "/logs full" sends the
+    whole current file. Lets you pull logs over Telegram and analyse locally.
+    (In a group chat the file is visible to the group — DM the bot for privacy.)
+
+tests/unit/test_logging.py (NEW) — file sink writes; tail reads it; path location.
+
+--------------------------------------------------------------------------------
+FOLLOW-UPS (not done here)
+--------------------------------------------------------------------------------
+  - Existing trading.db won't get the new unique constraint via create_all —
+    start Phase 2 from a fresh DB, or add Alembic before Phase 3.
+  - Add an EXTERNAL watchdog (systemd/docker healthcheck) — the heartbeat is
+    in-process and can't detect a fully dead loop.
+  - Set ALPACA_DATA_FEED=sip once subscribed so live volume matches backtest.
+================================================================================
