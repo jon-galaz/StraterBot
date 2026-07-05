@@ -9,17 +9,41 @@ On startup it sends a status message to the configured Telegram chat.
 """
 import asyncio
 import io
+import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from loguru import logger
 from sqlalchemy import select
+from telegram import BotCommand
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler
 
 # US market close is 16:00 ET year-round; scheduling market-relative jobs in ET
 # (not a fixed UTC hour) keeps them correct across DST changes.
 ET = ZoneInfo("America/New_York")
+
+_SIGNAL_STATUS_EMOJI = {
+    "pending": "⏳", "executing": "⚙️", "executed": "✅",
+    "rejected": "❌", "expired": "⌛",
+}
+
+
+def format_signals(rows: list[tuple]) -> str:
+    """Render (timestamp, ticker, price, status) rows (newest first) as an HTML
+    Telegram message. Kept module-level so it's unit-testable."""
+    if not rows:
+        return "No signals recorded yet."
+    lines = [f"🔔 <b>Last {len(rows)} signal(s)</b>  (newest first)", ""]
+    for ts, ticker, price, status in rows:
+        emoji = _SIGNAL_STATUS_EMOJI.get(status, "•")
+        lines.append(
+            f"{emoji} <code>{ts:%m-%d %H:%M}</code>  "
+            f"<b>{ticker}</b> ${price:.2f}  {status}"
+        )
+    lines += ["", "⌛ expired = fired but never actioned"]
+    return "\n".join(lines)
 
 from trading_system.config import Settings
 from trading_system.data.alpaca_adapter import make_data_client
@@ -33,7 +57,7 @@ from trading_system.logging_setup import configure_logging, log_file_path, read_
 from trading_system.scanner.job import scan_universe
 from trading_system.sizing import compute_universe_sizing, save_risk_map
 from trading_system.store.db import init_db, make_engine, make_session_factory
-from trading_system.store.models import TradeRecord
+from trading_system.store.models import SignalRecord, TradeRecord
 
 
 def build_app(settings: Settings) -> Application:
@@ -166,6 +190,28 @@ def build_app(settings: Settings) -> Application:
         buf.name = f"strater_tail_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}.log"
         await update.message.reply_document(document=buf, caption=f"📜 Last {n} log lines")
 
+    async def cmd_signals(update, context):
+        # Recent signal history so you can audit what fired and what happened to
+        # each — an 'expired' signal is one that fired but was never actioned.
+        if not _is_trader(update):
+            await update.message.reply_text("⛔ Only authorised traders can use this command.")
+            return
+        try:
+            n = max(1, min(int(context.args[0]), 50)) if context.args else 15
+        except ValueError:
+            n = 15
+
+        def _fetch():
+            with session_factory() as session:
+                rows = session.execute(
+                    select(SignalRecord).order_by(SignalRecord.timestamp.desc()).limit(n)
+                ).scalars().all()
+                # Detach into plain tuples inside the session.
+                return [(r.timestamp, r.ticker, r.price, r.status) for r in rows]
+
+        rows = await asyncio.to_thread(_fetch)
+        await update.message.reply_text(format_signals(rows), parse_mode="HTML")
+
     async def recompute_sizing(bot=None, target_chat_id=None):
         """Refresh per-ticker risk_pct from a 2-yr rolling backtest."""
         logger.info("Sizing: recomputing per-ticker Kelly")
@@ -200,15 +246,32 @@ def build_app(settings: Settings) -> Application:
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("recompute_sizing", cmd_recompute_sizing))
     app.add_handler(CommandHandler("logs", cmd_logs))
+    app.add_handler(CommandHandler("signals", cmd_signals))
+
+    _last_error_notify = {"at": 0.0, "text": ""}
 
     async def on_error(update, context):
-        # Without this, handler exceptions are logged by PTB but invisible to the
-        # trader — for a trading tool, surface failures loudly.
-        logger.exception(f"Unhandled handler error: {context.error}")
+        # Surface genuine handler failures to the trader — but NOT transient
+        # network blips. python-telegram-bot's long-poll regularly raises
+        # NetworkError/TimedOut (e.g. httpx.ReadError) when a connection drops
+        # mid-read; PTB retries automatically, so these are noise, not incidents.
+        err = context.error
+        if isinstance(err, (NetworkError, TimedOut, RetryAfter)) or \
+                type(err).__module__.split(".")[0] in ("httpx", "httpcore"):
+            logger.warning(f"Transient network error (auto-retried): {err!r}")
+            return
+
+        logger.exception(f"Unhandled handler error: {err}")
+        # Throttle chat alerts so a repeating error can't flood the chat either.
+        now = time.monotonic()
+        msg = str(err)
+        if msg == _last_error_notify["text"] and now - _last_error_notify["at"] < 60:
+            return
+        _last_error_notify.update(at=now, text=msg)
         try:
             await app.bot.send_message(
                 chat_id=chat_id,
-                text=f"❌ <b>Internal error</b>: <code>{context.error}</code>",
+                text=f"❌ <b>Internal error</b>: <code>{err}</code>",
                 parse_mode="HTML",
             )
         except Exception:
@@ -218,6 +281,17 @@ def build_app(settings: Settings) -> Application:
 
     # ── Scheduler (starts after Telegram bot is up) ───────────────────────────
     async def post_init(application: Application) -> None:
+        # Persistent command menu (the "/" autocomplete in Telegram clients) so
+        # the commands are always visible, not just in the startup message.
+        await application.bot.set_my_commands([
+            BotCommand("status", "Equity, positions, pending orders, kill switch"),
+            BotCommand("signals", "Recent signal history and their status"),
+            BotCommand("scan", "Run a manual universe scan now"),
+            BotCommand("recompute_sizing", "Refresh per-ticker Kelly sizing (~30s)"),
+            BotCommand("reset_killswitch", "Clear the kill switch, allow new entries"),
+            BotCommand("logs", "Fetch recent logs as a file"),
+        ])
+
         scheduler = AsyncIOScheduler(timezone="UTC")
 
         # Scanner: weekdays at 16:05 ET (5 min after the 16:00 close, DST-safe)
@@ -281,7 +355,7 @@ def build_app(settings: Settings) -> Application:
                 f"Max positions: {settings.max_concurrent_positions}\n"
                 f"Daily max loss: {settings.daily_max_loss_pct}%\n"
                 f"Approval timeout: {settings.approval_timeout_minutes} min\n\n"
-                f"Commands: /status  /scan  /recompute_sizing  /reset_killswitch  /logs"
+                f"Commands: /status  /signals  /scan  /recompute_sizing  /reset_killswitch  /logs"
             ),
             parse_mode="HTML",
         )

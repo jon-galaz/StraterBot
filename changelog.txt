@@ -190,6 +190,34 @@ main.py
 tests/unit/test_logging.py (NEW) — file sink writes; tail reads it; path location.
 
 --------------------------------------------------------------------------------
+2026-06-18 (addendum) — Stop Telegram spam from transient network errors
+--------------------------------------------------------------------------------
+main.py on_error handler
+  - Was forwarding EVERY error to the chat, including PTB's routine long-poll
+    NetworkError/TimedOut (e.g. httpx.ReadError) that PTB auto-retries -> chat
+    spam. Now: transient network/httpx/httpcore errors are logged at WARNING and
+    NOT sent to chat. Genuine errors are still surfaced, but throttled (same
+    message not re-sent within 60s) so a repeating failure can't flood the chat.
+
+--------------------------------------------------------------------------------
+2026-06-18 (addendum) — /signals command + persistent Telegram command menu
+--------------------------------------------------------------------------------
+main.py
+  - NEW /signals command (trader-only): shows recent signal history newest-first
+    with a status emoji (⏳pending ⚙️executing ✅executed ❌rejected ⌛expired).
+    "/signals" shows 15, "/signals N" shows up to 50. Lets you audit what fired
+    and what happened to each (⌛expired = fired but never actioned) from your
+    phone — no SSH. Query runs via asyncio.to_thread.
+  - format_signals() extracted to module level (pure, unit-tested).
+  - Registered a PERSISTENT Telegram command menu via bot.set_my_commands in
+    post_init (the "/" autocomplete list, always visible) covering status,
+    signals, scan, recompute_sizing, reset_killswitch, logs. Also added /signals
+    to the startup message command list.
+
+tests/unit/test_signals_command.py (NEW) — formatting (incl. status emoji) and
+    the newest-first / limited DB query.
+
+--------------------------------------------------------------------------------
 FOLLOW-UPS (not done here)
 --------------------------------------------------------------------------------
   - Existing trading.db won't get the new unique constraint via create_all —
