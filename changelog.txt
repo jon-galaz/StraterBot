@@ -218,6 +218,27 @@ tests/unit/test_signals_command.py (NEW) — formatting (incl. status emoji) and
     the newest-first / limited DB query.
 
 --------------------------------------------------------------------------------
+2026-07-08 (addendum) — Reconciliation false positive on post-close approvals
+--------------------------------------------------------------------------------
+src/trading_system/safety/reconciliation.py
+  - FIXED: reconciliation flagged "LOCAL open: X — not found in Alpaca" for every
+    trade approved after the 16:00 close. Root cause: the scanner fires at 16:05
+    ET (after close), so an approved market/DAY bracket order is ACCEPTED by
+    Alpaca but queued for the next open — no position exists yet at the 16:30
+    reconciliation. Reconciliation only inspected positions, not orders, so it
+    couldn't tell "pending fill" from "truly gone".
+  - Now order-aware (same "never assume gone" rule the position monitor uses):
+    fetches open orders; a local open trade that is UNFILLED (fill_price IS NULL)
+    and has a matching accepted/pending Alpaca order is reported as "⏳ pending
+    fill", not a mismatch. A filled-but-missing position, or an unfilled trade
+    with NO Alpaca order, is still flagged as real drift.
+
+tests/unit/test_reconciliation.py
+  - FakeClient gained get_orders; _open_trade takes fill_price.
+  - New: pending-order → not a mismatch; no-order → mismatch; filled-but-missing
+    → mismatch. 60 -> 63 tests.
+
+--------------------------------------------------------------------------------
 FOLLOW-UPS (not done here)
 --------------------------------------------------------------------------------
   - Existing trading.db won't get the new unique constraint via create_all —
